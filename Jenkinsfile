@@ -1,8 +1,5 @@
-// Jenkinsfile — updated to fix: "container node not found", kubeconfig/permission and TLS issues.
-// Preserves the earlier working stages (checkout, npm build). Only agent + kubectl/kaniko logic changed.
-
+// Jenkinsfile — fixed kubectl installation/usage + Kaniko build
 pipeline {
-  // Use a Kubernetes pod template for the agent so the 'node' container always exists.
   agent {
     kubernetes {
       label "jnlp-node-${env.BUILD_NUMBER ?: 'manual'}"
@@ -10,16 +7,12 @@ pipeline {
       yaml """
 apiVersion: v1
 kind: Pod
-metadata:
-  labels:
-    app: jenkins-agent-pod
 spec:
   serviceAccountName: default
   containers:
     - name: node
       image: node:18-bullseye
-      command:
-        - cat
+      command: ['cat']
       tty: true
       resources:
         requests:
@@ -28,7 +21,6 @@ spec:
         limits:
           memory: "1Gi"
           cpu: "1"
-    # The jnlp container is automatically provided by the plugin; inbound-agent image will be used.
 """
     }
   }
@@ -39,13 +31,12 @@ spec:
     NAMESPACE = "dev-cicd"
     WORKDIR = "${env.WORKSPACE}"
     KUBECONFIG_PATH = "${env.WORKSPACE}/.kube/config"
+    KUBECTL = "${env.WORKSPACE}/.local/bin/kubectl"
   }
 
   stages {
     stage('Checkout') {
-      steps {
-        checkout scm
-      }
+      steps { checkout scm }
     }
 
     stage('Use Nexus npm proxy') {
@@ -75,7 +66,7 @@ spec:
 
     stage('Prepare kubeconfig') {
       steps {
-        // jenkins-kubeconfig credential should be "Secret file" that you already created
+        // jenkins-kubeconfig must be a "Secret file" credential
         withCredentials([file(credentialsId: 'jenkins-kubeconfig', variable: 'KCFG')]) {
           container('node') {
             sh '''
@@ -84,8 +75,7 @@ spec:
               cp "$KCFG" "${KUBECONFIG_PATH}"
               chmod 600 "${KUBECONFIG_PATH}"
               echo "Written kubeconfig at ${KUBECONFIG_PATH}"
-              # show current contexts for debug (masked in Jenkins)
-              kubectl --kubeconfig="${KUBECONFIG_PATH}" config view --minify -o jsonpath='{.contexts[0].name}' || true
+              # don't call kubectl here — ensure we install it first
             '''
           }
         }
@@ -97,19 +87,18 @@ spec:
         container('node') {
           sh '''
             set -eu
-            if command -v kubectl >/dev/null 2>&1; then
-              echo "kubectl already present: $(command -v kubectl)"
+            mkdir -p "$(dirname ${KUBECTL})"
+            if [ -x "${KUBECTL}" ]; then
+              echo "kubectl already present: ${KUBECTL}"
             else
-              echo "Installing kubectl to $HOME/.local/bin ..."
-              mkdir -p "$HOME/.local/bin"
+              echo "Installing kubectl to ${KUBECTL} ..."
               STABLE=$(curl -L -s https://dl.k8s.io/release/stable.txt)
               curl -L -o /tmp/kubectl "https://dl.k8s.io/release/${STABLE}/bin/linux/amd64/kubectl"
               chmod +x /tmp/kubectl
-              mv /tmp/kubectl "$HOME/.local/bin/kubectl"
-              export PATH="$HOME/.local/bin:$PATH"
-              echo "kubectl installed: $(command -v kubectl)"
+              mv /tmp/kubectl "${KUBECTL}"
+              echo "kubectl installed: ${KUBECTL}"
             fi
-            kubectl --kubeconfig="${KUBECONFIG_PATH}" version --client || true
+            "${KUBECTL}" --kubeconfig="${KUBECONFIG_PATH}" version --client || true
           '''
         }
       }
@@ -134,26 +123,21 @@ spec:
 
     stage('Build & Push image (Kaniko)') {
       steps {
-        // Ensure nexus-docker-creds exists as usernamePassword credential in Jenkins
         withCredentials([usernamePassword(credentialsId: 'nexus-docker-creds', usernameVariable: 'NEXUS_USER', passwordVariable: 'NEXUS_PASS')]) {
           container('node') {
             sh '''
               set -eu
-
-              # Always use explicit kubeconfig to avoid in-cluster default-sa usage
               export KUBECONFIG="${KUBECONFIG_PATH}"
-              KCTL="kubectl --kubeconfig=${KUBECONFIG}"
+              KCTL="${KUBECTL} --kubeconfig=${KUBECONFIG}"
 
-              # If TLS CA errors occur, set cluster to skip TLS verify (dev only)
-              CLUSTER_NAME=$(${KCTL} config view -o jsonpath='{.clusters[0].name}')
-              if [ -n "${CLUSTER_NAME:-}" ]; then
-                echo "Setting cluster ${CLUSTER_NAME} to insecure-skip-tls-verify (local/dev workaround)"
+              # If cert verification fails in dev, set cluster to skip tls verify (dev only)
+              CLUSTER_NAME=$(${KCTL} config view -o jsonpath='{.clusters[0].name}' 2>/dev/null || true)
+              if [ -n "${CLUSTER_NAME}" ]; then
+                echo "Setting cluster ${CLUSTER_NAME} --insecure-skip-tls-verify=true (dev fallback)"
                 ${KCTL} config set-cluster "${CLUSTER_NAME}" --insecure-skip-tls-verify=true || true
               fi
 
               POD_NAME="kaniko-build-${BUILD_NUMBER}"
-              echo "Creating kaniko pod manifest for ${POD_NAME}"
-
               cat > kaniko-pod.yaml <<'YAML'
 apiVersion: v1
 kind: Pod
@@ -188,23 +172,22 @@ YAML
               sed -i "s|IMAGE_PLACEHOLDER|${IMAGE}|g" kaniko-pod.yaml
               sed -i "s|TAG_PLACEHOLDER|${TAG}|g" kaniko-pod.yaml
 
-              # apply the kaniko pod using explicit kubeconfig (so it uses jenkins-sa credentials from file)
-              echo "Applying kaniko pod..."
+              echo "Applying kaniko pod manifest..."
               if ! ${KCTL} -n ${NAMESPACE} apply -f kaniko-pod.yaml; then
-                echo "kubectl apply failed; showing last events:"
-                ${KCTL} -n ${NAMESPACE} get events --sort-by='.lastTimestamp' | tail -n 15 || true
+                echo "kubectl apply failed — dumping events and pods:"
+                ${KCTL} -n ${NAMESPACE} get events --sort-by='.lastTimestamp' | tail -n 20 || true
                 ${KCTL} -n ${NAMESPACE} get pods -o wide || true
                 exit 3
               fi
 
-              # wait for pod to be created
+              # wait for pod to appear
               for i in {1..30}; do
                 if ${KCTL} -n ${NAMESPACE} get pod ${POD_NAME} >/dev/null 2>&1; then break; fi
                 sleep 1
               done
 
-              # copy workspace archive to pod
-              for i in 1 2 3; do
+              # copy workspace -> try few times
+              for run in 1 2 3; do
                 if ${KCTL} -n ${NAMESPACE} cp workspace.tar.gz ${POD_NAME}:/workspace/workspace.tar.gz 2>/dev/null; then
                   echo "Copied workspace.tar.gz to ${POD_NAME}"
                   break
@@ -213,15 +196,11 @@ YAML
                 sleep 2
               done
 
-              # stream logs (kaniko will build+push). This blocks until Kaniko finishes.
-              echo "Streaming kaniko logs..."
+              echo "Streaming kaniko logs (build+push) — this will block until complete:"
               ${KCTL} -n ${NAMESPACE} logs -f ${POD_NAME} || true
 
-              # cleanup
-              echo "Deleting kaniko pod..."
+              echo "Cleaning up kaniko pod..."
               ${KCTL} -n ${NAMESPACE} delete pod ${POD_NAME} --ignore-not-found || true
-
-              echo "Kaniko step finished. Check logs above for image push success."
             '''
           }
         }
@@ -233,8 +212,7 @@ YAML
         container('node') {
           sh '''
             set -eu
-            KCTL="kubectl --kubeconfig=${KUBECONFIG_PATH}"
-            # Try to update image; if no deployment present apply manifest from repo
+            KCTL="${KUBECTL} --kubeconfig=${KUBECONFIG_PATH}"
             if ${KCTL} -n ${NAMESPACE} set image deployment/frontend-deployment frontend=${IMAGE}:${TAG} --record 2>/dev/null; then
               echo "Updated deployment image to ${IMAGE}:${TAG}"
             else
@@ -249,8 +227,6 @@ YAML
 
   post {
     success { echo "Deployed ${IMAGE}:${TAG}" }
-    failure {
-      echo "Pipeline failed - check console output"
-    }
+    failure { echo "Pipeline failed — inspect console log" }
   }
 }
