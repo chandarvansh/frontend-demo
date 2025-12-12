@@ -1,5 +1,4 @@
 pipeline {
-  // use Kubernetes agent so every run gets a pod that contains both 'jnlp' and 'node' containers
   agent {
     kubernetes {
       label "jnlp-node-${env.BUILD_NUMBER}"
@@ -52,9 +51,7 @@ spec:
   }
 
   stages {
-    stage('Checkout SCM') {
-      steps { checkout scm }
-    }
+    stage('Checkout SCM') { steps { checkout scm } }
 
     stage('Use Nexus npm proxy') {
       steps {
@@ -65,7 +62,6 @@ spec:
 
     stage('Install & Build') {
       steps {
-        // defaultContainer is node, so this runs inside node container
         sh 'npm ci'
         sh 'npm run build -- --configuration production'
       }
@@ -123,13 +119,14 @@ spec:
             export KUBECONFIG=$WORKSPACE/.kube/config
             KUBECTL="$WORKSPACE/.local/bin/kubectl --kubeconfig=$KUBECONFIG"
 
-            # if cluster present, allow insecure skip (dev fallback)
             CLUSTER_NAME=$($KUBECTL config view -o jsonpath='{.clusters[0].name}' 2>/dev/null || echo "")
             if [ -n "$CLUSTER_NAME" ]; then
               $KUBECTL config set-cluster "$CLUSTER_NAME" --insecure-skip-tls-verify=true || true
             fi
 
             POD_NAME="kaniko-build-${BUILD_NUMBER}"
+
+            # Kaniko pod manifest with WAIT logic: kaniko container will wait for workspace.tar.gz before running executor
             cat > kaniko-pod.yaml <<'YAML'
 apiVersion: v1
 kind: Pod
@@ -141,11 +138,28 @@ spec:
   containers:
   - name: kaniko
     image: gcr.io/kaniko-project/executor:latest
+    command:
+      - /bin/sh
+      - -c
     args:
-      - "--context=tar://workspace.tar.gz"
-      - "--dockerfile=/workspace/Dockerfile"
-      - "--destination=IMAGE_PLACEHOLDER:TAG_PLACEHOLDER"
-      - "--skip-tls-verify=true"
+      - |
+        echo "kaniko container started; waiting for /workspace/workspace.tar.gz ..."
+        # wait (timeout) for the workspace tar to be copied in by Jenkins (kubectl cp)
+        MAX_WAIT=120
+        waited=0
+        while [ ! -f /workspace/workspace.tar.gz ]; do
+          if [ "$waited" -ge "$MAX_WAIT" ]; then
+            echo "Timed out waiting for workspace.tar.gz after ${MAX_WAIT}s"
+            exit 1
+          fi
+          echo "waiting for workspace.tar.gz ($waited)s..."
+          sleep 1
+          waited=$((waited+1))
+        done
+        echo "workspace.tar.gz found; extracting and running kaniko..."
+        # extract tar so kaniko can see Dockerfile and context files if needed
+        tar -C /workspace -xzf /workspace/workspace.tar.gz || true
+        exec /kaniko/executor --context=tar://workspace/workspace.tar.gz --dockerfile=/workspace/Dockerfile --destination=IMAGE_PLACEHOLDER:TAG_PLACEHOLDER --skip-tls-verify=true
     volumeMounts:
       - name: workspace
         mountPath: /workspace
@@ -167,17 +181,10 @@ YAML
             echo "Applying kaniko pod manifest..."
             $KUBECTL -n ${NAMESPACE} apply -f kaniko-pod.yaml
 
-            echo "Waiting for pod ${POD_NAME} to become Ready..."
-            if ! $KUBECTL -n ${NAMESPACE} wait --for=condition=Ready pod/${POD_NAME} --timeout=120s; then
-              echo "Pod did not become Ready - showing describe & events"
-              $KUBECTL -n ${NAMESPACE} describe pod ${POD_NAME} || true
-              $KUBECTL -n ${NAMESPACE} get events --sort-by='.lastTimestamp' -o wide || true
-              $KUBECTL -n ${NAMESPACE} logs ${POD_NAME} --all-containers || true
-              $KUBECTL -n ${NAMESPACE} delete pod ${POD_NAME} --ignore-not-found
-              exit 1
-            fi
+            echo "Waiting for kaniko pod to be scheduled..."
+            $KUBECTL -n ${NAMESPACE} wait --for=condition=PodScheduled pod/${POD_NAME} --timeout=60s || true
 
-            # copy workspace into the pod (retry)
+            # Copy workspace.tar.gz into the pod (retry a few times)
             for i in 1 2 3 4 5; do
               if $KUBECTL -n ${NAMESPACE} cp workspace.tar.gz ${POD_NAME}:/workspace/workspace.tar.gz 2>/dev/null; then
                 echo "Copied workspace.tar.gz to pod"
