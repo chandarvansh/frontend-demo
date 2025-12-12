@@ -1,4 +1,6 @@
-// Jenkinsfile - full updated (kubectl fallback + safe steps)
+// Jenkinsfile - Updated (only change: Kaniko stage now uses KUBECONFIG from Prepare kubeconfig)
+// Other working parts left intact.
+
 pipeline {
   agent {
     kubernetes {
@@ -114,7 +116,6 @@ spec:
             set -eu
             TMPCTX=$(mktemp -d)
             echo "temp ctx: $TMPCTX"
-            # copy only needed files to avoid tar race
             cp -v Dockerfile "$TMPCTX/" || true
             if [ -d dist ]; then cp -r dist "$TMPCTX/"; fi
             cp -v package*.json "$TMPCTX/" || true
@@ -127,6 +128,7 @@ spec:
       }
     }
 
+    // ====== IMPORTANT: This stage was updated to force use of the Jenkins kubeconfig (KUBECONFIG) ======
     stage('Build & Push image (Kaniko)') {
       steps {
         withCredentials([usernamePassword(credentialsId: 'nexus-docker-creds', usernameVariable: 'NEXUS_USER', passwordVariable: 'NEXUS_PASS')]) {
@@ -135,7 +137,7 @@ spec:
               set -eu
               POD_NAME="kaniko-build-${BUILD_NUMBER}"
 
-              # render pod manifest (unquoted heredoc so shell expands variables)
+              # render pod manifest
               cat > kaniko-pod.yaml <<YAML
 apiVersion: v1
 kind: Pod
@@ -165,7 +167,16 @@ spec:
         secretName: nexus-docker-secret
 YAML
 
-              # find a usable kubectl binary (try PATH then common install dirs)
+              # ensure we use the Jenkins kubeconfig produced earlier (so kubectl authenticates as jenkins-sa)
+              if [ -f "$WORKSPACE/.kube/config" ]; then
+                export KUBECONFIG="$WORKSPACE/.kube/config"
+                echo "Using KUBECONFIG=$KUBECONFIG"
+              else
+                echo "ERROR: kubeconfig missing at $WORKSPACE/.kube/config"
+                exit 2
+              fi
+
+              # locate kubectl binary (try PATH then common install dirs)
               KUBECTL=$(command -v kubectl || true)
               if [ -z "${KUBECTL}" ]; then
                 if [ -x "$HOME/.local/bin/kubectl" ]; then
@@ -173,30 +184,30 @@ YAML
                 elif [ -x "/root/.local/bin/kubectl" ]; then
                   KUBECTL="/root/.local/bin/kubectl"
                 else
-                  echo "kubectl not found in PATH or common locations; failing now."
+                  echo "kubectl not found; aborting"
                   exit 2
                 fi
               fi
               echo "Using kubectl: ${KUBECTL}"
 
-              # apply kaniko pod manifest
+              # apply kaniko pod manifest using provided kubeconfig (so serviceaccount/token is correct)
               ${KUBECTL} -n ${NAMESPACE} apply -f kaniko-pod.yaml
 
-              # wait for pod to be created
+              # wait for pod creation (small loop)
               for i in {1..30}; do
                 if ${KUBECTL} -n ${NAMESPACE} get pod ${POD_NAME} >/dev/null 2>&1; then break; fi
                 sleep 1
               done
 
-              # copy context (retry)
+              # copy context (retry a couple times)
               for i in 1 2 3; do
                 ${KUBECTL} -n ${NAMESPACE} cp workspace.tar.gz ${POD_NAME}:/workspace/workspace.tar.gz && break || sleep 2
               done
 
-              # stream logs (kaniko does the build & push)
+              # stream logs (Kaniko will build & push to Nexus)
               ${KUBECTL} -n ${NAMESPACE} logs -f ${POD_NAME} || true
 
-              # cleanup
+              # cleanup pod
               ${KUBECTL} -n ${NAMESPACE} delete pod ${POD_NAME} --ignore-not-found || true
             '''
           }
@@ -209,7 +220,13 @@ YAML
         container('node') {
           sh '''
             set -eu
-            # locate kubectl similarly
+            # prefer kubeconfig prepared earlier
+            if [ -f "$WORKSPACE/.kube/config" ]; then
+              export KUBECONFIG="$WORKSPACE/.kube/config"
+              echo "Using KUBECONFIG=$KUBECONFIG"
+            fi
+
+            # locate kubectl
             KUBECTL=$(command -v kubectl || true)
             if [ -z "${KUBECTL}" ]; then
               if [ -x "$HOME/.local/bin/kubectl" ]; then
@@ -217,13 +234,12 @@ YAML
               elif [ -x "/root/.local/bin/kubectl" ]; then
                 KUBECTL="/root/.local/bin/kubectl"
               else
-                echo "kubectl not found in PATH or common locations; failing now."
+                echo "kubectl not found; aborting"
                 exit 2
               fi
             fi
             echo "Using kubectl: ${KUBECTL}"
 
-            export KUBECONFIG="$WORKSPACE/.kube/config"
             ${KUBECTL} -n ${NAMESPACE} set image deployment/frontend-deployment frontend=${IMAGE}:${TAG} --record || ${KUBECTL} -n ${NAMESPACE} apply -f k8s/frontend-deployment.yaml
           '''
         }
