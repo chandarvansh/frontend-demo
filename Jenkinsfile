@@ -1,4 +1,4 @@
-// Jenkinsfile - compatible version (no pipefail)
+// Jenkinsfile - full updated (kubectl fallback + safe steps)
 pipeline {
   agent {
     kubernetes {
@@ -73,10 +73,11 @@ spec:
           container('node') {
             sh '''
               set -eu
-              mkdir -p $WORKSPACE/.kube
-              cp "$KCFG" $WORKSPACE/.kube/config
-              chmod 600 $WORKSPACE/.kube/config
-              export KUBECONFIG=$WORKSPACE/.kube/config
+              mkdir -p "$WORKSPACE/.kube"
+              cp "$KCFG" "$WORKSPACE/.kube/config"
+              chmod 600 "$WORKSPACE/.kube/config"
+              export KUBECONFIG="$WORKSPACE/.kube/config"
+              # show context if kubectl exists (don't fail if not)
               command -v kubectl >/dev/null 2>&1 && kubectl config current-context || true
             '''
           }
@@ -90,16 +91,16 @@ spec:
           sh '''
             set -eu
             if command -v kubectl >/dev/null 2>&1; then
-              echo "kubectl present: $(kubectl version --client 2>/dev/null || true)"
+              echo "kubectl already present: $(kubectl version --client 2>/dev/null || true)"
             else
               echo "Installing kubectl to $HOME/.local/bin ..."
               STABLE=$(curl -L -s https://dl.k8s.io/release/stable.txt)
               curl -L -o /tmp/kubectl "https://dl.k8s.io/release/${STABLE}/bin/linux/amd64/kubectl"
               chmod +x /tmp/kubectl
-              mkdir -p $HOME/.local/bin
-              mv /tmp/kubectl $HOME/.local/bin/kubectl
-              export PATH=$HOME/.local/bin:$PATH
-              kubectl version --client || true
+              mkdir -p "$HOME/.local/bin"
+              mv /tmp/kubectl "$HOME/.local/bin/kubectl"
+              export PATH="$HOME/.local/bin:$PATH"
+              echo "kubectl installed: $(command -v kubectl || true)"; kubectl version --client || true
             fi
           '''
         }
@@ -112,12 +113,15 @@ spec:
           sh '''
             set -eu
             TMPCTX=$(mktemp -d)
+            echo "temp ctx: $TMPCTX"
+            # copy only needed files to avoid tar race
             cp -v Dockerfile "$TMPCTX/" || true
             if [ -d dist ]; then cp -r dist "$TMPCTX/"; fi
             cp -v package*.json "$TMPCTX/" || true
             ls -la "$TMPCTX"
             tar -C "$TMPCTX" -czf workspace.tar.gz .
             rm -rf "$TMPCTX"
+            ls -lh workspace.tar.gz
           '''
         }
       }
@@ -130,7 +134,9 @@ spec:
             sh '''
               set -eu
               POD_NAME="kaniko-build-${BUILD_NUMBER}"
-              cat > kaniko-pod.yaml <<'YAML'
+
+              # render pod manifest (unquoted heredoc so shell expands variables)
+              cat > kaniko-pod.yaml <<YAML
 apiVersion: v1
 kind: Pod
 metadata:
@@ -159,16 +165,39 @@ spec:
         secretName: nexus-docker-secret
 YAML
 
-              kubectl -n ${NAMESPACE} apply -f kaniko-pod.yaml
+              # find a usable kubectl binary (try PATH then common install dirs)
+              KUBECTL=$(command -v kubectl || true)
+              if [ -z "${KUBECTL}" ]; then
+                if [ -x "$HOME/.local/bin/kubectl" ]; then
+                  KUBECTL="$HOME/.local/bin/kubectl"
+                elif [ -x "/root/.local/bin/kubectl" ]; then
+                  KUBECTL="/root/.local/bin/kubectl"
+                else
+                  echo "kubectl not found in PATH or common locations; failing now."
+                  exit 2
+                fi
+              fi
+              echo "Using kubectl: ${KUBECTL}"
 
+              # apply kaniko pod manifest
+              ${KUBECTL} -n ${NAMESPACE} apply -f kaniko-pod.yaml
+
+              # wait for pod to be created
               for i in {1..30}; do
-                if kubectl -n ${NAMESPACE} get pod ${POD_NAME} >/dev/null 2>&1; then break; fi
+                if ${KUBECTL} -n ${NAMESPACE} get pod ${POD_NAME} >/dev/null 2>&1; then break; fi
                 sleep 1
               done
 
-              kubectl -n ${NAMESPACE} cp workspace.tar.gz ${POD_NAME}:/workspace/workspace.tar.gz
-              kubectl -n ${NAMESPACE} logs -f ${POD_NAME}
-              kubectl -n ${NAMESPACE} delete pod ${POD_NAME} --ignore-not-found
+              # copy context (retry)
+              for i in 1 2 3; do
+                ${KUBECTL} -n ${NAMESPACE} cp workspace.tar.gz ${POD_NAME}:/workspace/workspace.tar.gz && break || sleep 2
+              done
+
+              # stream logs (kaniko does the build & push)
+              ${KUBECTL} -n ${NAMESPACE} logs -f ${POD_NAME} || true
+
+              # cleanup
+              ${KUBECTL} -n ${NAMESPACE} delete pod ${POD_NAME} --ignore-not-found || true
             '''
           }
         }
@@ -180,8 +209,22 @@ YAML
         container('node') {
           sh '''
             set -eu
-            export KUBECONFIG=$WORKSPACE/.kube/config
-            kubectl -n ${NAMESPACE} set image deployment/frontend-deployment frontend=${IMAGE}:${TAG} --record || kubectl -n ${NAMESPACE} apply -f k8s/frontend-deployment.yaml
+            # locate kubectl similarly
+            KUBECTL=$(command -v kubectl || true)
+            if [ -z "${KUBECTL}" ]; then
+              if [ -x "$HOME/.local/bin/kubectl" ]; then
+                KUBECTL="$HOME/.local/bin/kubectl"
+              elif [ -x "/root/.local/bin/kubectl" ]; then
+                KUBECTL="/root/.local/bin/kubectl"
+              else
+                echo "kubectl not found in PATH or common locations; failing now."
+                exit 2
+              fi
+            fi
+            echo "Using kubectl: ${KUBECTL}"
+
+            export KUBECONFIG="$WORKSPACE/.kube/config"
+            ${KUBECTL} -n ${NAMESPACE} set image deployment/frontend-deployment frontend=${IMAGE}:${TAG} --record || ${KUBECTL} -n ${NAMESPACE} apply -f k8s/frontend-deployment.yaml
           '''
         }
       }
