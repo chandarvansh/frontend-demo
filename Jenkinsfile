@@ -1,9 +1,54 @@
 pipeline {
-  agent any
+  // use Kubernetes agent so every run gets a pod that contains both 'jnlp' and 'node' containers
+  agent {
+    kubernetes {
+      label "jnlp-node-${env.BUILD_NUMBER}"
+      defaultContainer "node"
+      yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: jenkins-agent-pod
+spec:
+  serviceAccountName: default
+  restartPolicy: Never
+  containers:
+    - name: node
+      image: node:18-bullseye
+      command:
+        - cat
+      tty: true
+      resources:
+        requests:
+          cpu: "250m"
+          memory: "512Mi"
+        limits:
+          cpu: "1"
+          memory: "1Gi"
+      volumeMounts:
+        - name: workspace-volume
+          mountPath: /home/jenkins/agent
+    - name: jnlp
+      image: jenkins/inbound-agent:latest
+      args:
+        - \$(JENKINS_SECRET)
+        - \$(JENKINS_NAME)
+      volumeMounts:
+        - name: workspace-volume
+          mountPath: /home/jenkins/agent
+  volumes:
+    - name: workspace-volume
+      emptyDir: {}
+"""
+    }
+  }
+
   environment {
     IMAGE = "nexus:5000/chandarvansh/frontend"
     TAG = "${env.BUILD_NUMBER}"
     NAMESPACE = "dev-cicd"
+    WORKSPACE_DIR = "${env.WORKSPACE}"
   }
 
   stages {
@@ -20,10 +65,9 @@ pipeline {
 
     stage('Install & Build') {
       steps {
-        container('node') {
-          sh 'npm ci'
-          sh 'npm run build -- --configuration production'
-        }
+        // defaultContainer is node, so this runs inside node container
+        sh 'npm ci'
+        sh 'npm run build -- --configuration production'
       }
     }
 
@@ -43,58 +87,50 @@ pipeline {
 
     stage('Ensure kubectl available') {
       steps {
-        container('node') {
-          sh '''
-            set -e
-            mkdir -p $WORKSPACE/.local/bin
-            STABLE=$(curl -L -s https://dl.k8s.io/release/stable.txt)
-            curl -L -o /tmp/kubectl "https://dl.k8s.io/release/${STABLE}/bin/linux/amd64/kubectl"
-            chmod +x /tmp/kubectl
-            mv /tmp/kubectl $WORKSPACE/.local/bin/kubectl
-            export PATH=$WORKSPACE/.local/bin:$PATH
-            kubectl --kubeconfig=$WORKSPACE/.kube/config version --client || true
-          '''
-        }
+        sh '''
+          set -e
+          mkdir -p $WORKSPACE/.local/bin
+          STABLE=$(curl -L -s https://dl.k8s.io/release/stable.txt)
+          curl -L -o /tmp/kubectl "https://dl.k8s.io/release/${STABLE}/bin/linux/amd64/kubectl"
+          chmod +x /tmp/kubectl
+          mv /tmp/kubectl $WORKSPACE/.local/bin/kubectl
+          export PATH=$WORKSPACE/.local/bin:$PATH
+          $WORKSPACE/.local/bin/kubectl --kubeconfig=$WORKSPACE/.kube/config version --client || true
+        '''
       }
     }
 
     stage('Build & Package for Kaniko') {
       steps {
-        container('node') {
-          sh '''
-            set -e
-            TMPCTX=$(mktemp -d)
-            cp Dockerfile "${TMPCTX}/" || true
-            [ -d dist ] && cp -r dist "${TMPCTX}/"
-            cp -v package.json package-lock.json "${TMPCTX}/" || true
-            tar -C "${TMPCTX}" -czf workspace.tar.gz .
-            rm -rf "${TMPCTX}"
-            ls -lh workspace.tar.gz
-          '''
-        }
+        sh '''
+          set -e
+          TMPCTX=$(mktemp -d)
+          cp Dockerfile "${TMPCTX}/" || true
+          [ -d dist ] && cp -r dist "${TMPCTX}/"
+          cp -v package.json package-lock.json "${TMPCTX}/" || true
+          tar -C "${TMPCTX}" -czf workspace.tar.gz .
+          rm -rf "${TMPCTX}"
+          ls -lh workspace.tar.gz
+        '''
       }
     }
 
     stage('Build & Push image (Kaniko)') {
       steps {
         withCredentials([usernamePassword(credentialsId: 'nexus-docker-creds', usernameVariable: 'NEXUS_USER', passwordVariable: 'NEXUS_PASS')]) {
-          container('node') {
-            sh '''
-              set -eu
+          sh '''
+            set -eu
+            export KUBECONFIG=$WORKSPACE/.kube/config
+            KUBECTL="$WORKSPACE/.local/bin/kubectl --kubeconfig=$KUBECONFIG"
 
-              export KUBECONFIG=$WORKSPACE/.kube/config
-              KUBECTL="$WORKSPACE/.local/bin/kubectl --kubeconfig=$KUBECONFIG"
+            # if cluster present, allow insecure skip (dev fallback)
+            CLUSTER_NAME=$($KUBECTL config view -o jsonpath='{.clusters[0].name}' 2>/dev/null || echo "")
+            if [ -n "$CLUSTER_NAME" ]; then
+              $KUBECTL config set-cluster "$CLUSTER_NAME" --insecure-skip-tls-verify=true || true
+            fi
 
-              # If cluster name present, avoid strict validation for dev clusters (keeps earlier behavior)
-              CLUSTER_NAME=$($KUBECTL config view -o jsonpath='{.clusters[0].name}' 2>/dev/null || echo "")
-              if [ -n "$CLUSTER_NAME" ]; then
-                echo "Setting cluster ${CLUSTER_NAME} --insecure-skip-tls-verify=true (dev fallback)"
-                $KUBECTL config set-cluster "$CLUSTER_NAME" --insecure-skip-tls-verify=true || true
-              fi
-
-              POD_NAME="kaniko-build-${BUILD_NUMBER}"
-              # create kaniko pod manifest (uses nexus-docker-secret for pushing)
-              cat > kaniko-pod.yaml <<'YAML'
+            POD_NAME="kaniko-build-${BUILD_NUMBER}"
+            cat > kaniko-pod.yaml <<'YAML'
 apiVersion: v1
 kind: Pod
 metadata:
@@ -123,69 +159,59 @@ spec:
         secretName: nexus-docker-secret
 YAML
 
-              sed -i "s|POD_NAME_PLACEHOLDER|${POD_NAME}|g" kaniko-pod.yaml
-              sed -i "s|NAMESPACE_PLACEHOLDER|${NAMESPACE}|g" kaniko-pod.yaml
-              sed -i "s|IMAGE_PLACEHOLDER|${IMAGE}|g" kaniko-pod.yaml
-              sed -i "s|TAG_PLACEHOLDER|${TAG}|g" kaniko-pod.yaml
+            sed -i "s|POD_NAME_PLACEHOLDER|${POD_NAME}|g" kaniko-pod.yaml
+            sed -i "s|NAMESPACE_PLACEHOLDER|${NAMESPACE}|g" kaniko-pod.yaml
+            sed -i "s|IMAGE_PLACEHOLDER|${IMAGE}|g" kaniko-pod.yaml
+            sed -i "s|TAG_PLACEHOLDER|${TAG}|g" kaniko-pod.yaml
 
-              echo "Applying kaniko pod manifest..."
-              $KUBECTL -n ${NAMESPACE} apply -f kaniko-pod.yaml
+            echo "Applying kaniko pod manifest..."
+            $KUBECTL -n ${NAMESPACE} apply -f kaniko-pod.yaml
 
-              # Wait for pod to become Ready (up to 120s). If not, show describe & events to debug.
-              echo "Waiting for pod ${POD_NAME} to become Ready..."
-              if ! $KUBECTL -n ${NAMESPACE} wait --for=condition=Ready pod/${POD_NAME} --timeout=120s; then
-                echo "Pod did not become Ready - showing details:"
-                $KUBECTL -n ${NAMESPACE} describe pod ${POD_NAME} || true
-                echo "Recent events:"
-                $KUBECTL -n ${NAMESPACE} get events --sort-by='.lastTimestamp' -o wide || true
-                echo "Attempting to stream logs (if any) then cleaning up..."
-                $KUBECTL -n ${NAMESPACE} logs ${POD_NAME} --all-containers || true
-                $KUBECTL -n ${NAMESPACE} delete pod ${POD_NAME} --ignore-not-found
-                exit 1
+            echo "Waiting for pod ${POD_NAME} to become Ready..."
+            if ! $KUBECTL -n ${NAMESPACE} wait --for=condition=Ready pod/${POD_NAME} --timeout=120s; then
+              echo "Pod did not become Ready - showing describe & events"
+              $KUBECTL -n ${NAMESPACE} describe pod ${POD_NAME} || true
+              $KUBECTL -n ${NAMESPACE} get events --sort-by='.lastTimestamp' -o wide || true
+              $KUBECTL -n ${NAMESPACE} logs ${POD_NAME} --all-containers || true
+              $KUBECTL -n ${NAMESPACE} delete pod ${POD_NAME} --ignore-not-found
+              exit 1
+            fi
+
+            # copy workspace into the pod (retry)
+            for i in 1 2 3 4 5; do
+              if $KUBECTL -n ${NAMESPACE} cp workspace.tar.gz ${POD_NAME}:/workspace/workspace.tar.gz 2>/dev/null; then
+                echo "Copied workspace.tar.gz to pod"
+                break
+              else
+                echo "kubectl cp failed, retrying ($i)..."
+                sleep 2
               fi
+            done
 
-              # copy workspace into the pod (retry if needed)
-              for i in 1 2 3 4 5; do
-                if $KUBECTL -n ${NAMESPACE} cp workspace.tar.gz ${POD_NAME}:/workspace/workspace.tar.gz 2>/dev/null; then
-                  echo "Copied workspace.tar.gz to pod"
-                  break
-                else
-                  echo "kubectl cp failed, retrying ($i)..."
-                  sleep 2
-                fi
-              done
+            echo "Streaming kaniko logs (build+push) — blocking until complete:"
+            $KUBECTL -n ${NAMESPACE} logs -f ${POD_NAME} -c kaniko || true
 
-              echo "Streaming kaniko logs (build+push) — this will block until complete:"
-              $KUBECTL -n ${NAMESPACE} logs -f ${POD_NAME} -c kaniko || true
-
-              echo "Cleaning up kaniko pod..."
-              $KUBECTL -n ${NAMESPACE} delete pod ${POD_NAME} --ignore-not-found || true
-            '''
-          }
+            echo "Cleaning up kaniko pod..."
+            $KUBECTL -n ${NAMESPACE} delete pod ${POD_NAME} --ignore-not-found || true
+          '''
         }
       }
     }
 
     stage('Deploy to cluster') {
       steps {
-        container('node') {
-          sh '''
-            set -eu
-            export KUBECONFIG=$WORKSPACE/.kube/config
-            KUBECTL="$WORKSPACE/.local/bin/kubectl --kubeconfig=$KUBECONFIG"
+        sh '''
+          set -eu
+          export KUBECONFIG=$WORKSPACE/.kube/config
+          KUBECTL="$WORKSPACE/.local/bin/kubectl --kubeconfig=$KUBECONFIG"
 
-            # Update deployment image (best-effort)
-            echo "Trying to update deployment image (if deployment exists)..."
-            $KUBECTL -n ${NAMESPACE} set image deployment/frontend-deployment frontend=${IMAGE}:${TAG} --record || true
+          $KUBECTL -n ${NAMESPACE} set image deployment/frontend-deployment frontend=${IMAGE}:${TAG} --record || true
 
-            # If k8s manifest exists in repo, apply it; else create a minimal fallback manifest and apply.
-            if [ -f k8s/frontend-deployment.yaml ]; then
-              echo "Applying repo manifest k8s/frontend-deployment.yaml"
-              $KUBECTL -n ${NAMESPACE} apply -f k8s/frontend-deployment.yaml
-            else
-              echo "k8s/frontend-deployment.yaml not found — creating minimal fallback manifest and applying"
-              mkdir -p k8s
-              cat > k8s/frontend-deployment.yaml <<YAML
+          if [ -f k8s/frontend-deployment.yaml ]; then
+            $KUBECTL -n ${NAMESPACE} apply -f k8s/frontend-deployment.yaml
+          else
+            mkdir -p k8s
+            cat > k8s/frontend-deployment.yaml <<YAML
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -207,10 +233,9 @@ spec:
           ports:
             - containerPort: 80
 YAML
-              $KUBECTL -n ${NAMESPACE} apply -f k8s/frontend-deployment.yaml
-            fi
-          '''
-        }
+            $KUBECTL -n ${NAMESPACE} apply -f k8s/frontend-deployment.yaml
+          fi
+        '''
       }
     }
   }
