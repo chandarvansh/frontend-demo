@@ -1,4 +1,4 @@
-// Jenkinsfile - compatible version (no unsupported options)
+// Jenkinsfile - compatible version (no pipefail)
 pipeline {
   agent {
     kubernetes {
@@ -58,7 +58,7 @@ spec:
       steps {
         container('node') {
           sh '''
-            set -euo pipefail
+            set -eu
             echo "node: $(node -v) npm: $(npm -v)"
             npm ci
             npm run build -- --configuration production
@@ -72,7 +72,7 @@ spec:
         withCredentials([file(credentialsId: 'jenkins-kubeconfig', variable: 'KCFG')]) {
           container('node') {
             sh '''
-              set -euo pipefail
+              set -eu
               mkdir -p $WORKSPACE/.kube
               cp "$KCFG" $WORKSPACE/.kube/config
               chmod 600 $WORKSPACE/.kube/config
@@ -88,7 +88,7 @@ spec:
       steps {
         container('node') {
           sh '''
-            set -euo pipefail
+            set -eu
             if command -v kubectl >/dev/null 2>&1; then
               echo "kubectl present: $(kubectl version --client 2>/dev/null || true)"
             else
@@ -110,7 +110,7 @@ spec:
       steps {
         container('node') {
           sh '''
-            set -euo pipefail
+            set -eu
             TMPCTX=$(mktemp -d)
             cp -v Dockerfile "$TMPCTX/" || true
             if [ -d dist ]; then cp -r dist "$TMPCTX/"; fi
@@ -128,7 +128,7 @@ spec:
         withCredentials([usernamePassword(credentialsId: 'nexus-docker-creds', usernameVariable: 'NEXUS_USER', passwordVariable: 'NEXUS_PASS')]) {
           container('node') {
             sh '''
-              set -euo pipefail
+              set -eu
               POD_NAME="kaniko-build-${BUILD_NUMBER}"
               cat > kaniko-pod.yaml <<'YAML'
 apiVersion: v1
@@ -179,7 +179,7 @@ YAML
       steps {
         container('node') {
           sh '''
-            set -euo pipefail
+            set -eu
             export KUBECONFIG=$WORKSPACE/.kube/config
             kubectl -n ${NAMESPACE} set image deployment/frontend-deployment frontend=${IMAGE}:${TAG} --record || kubectl -n ${NAMESPACE} apply -f k8s/frontend-deployment.yaml
           '''
