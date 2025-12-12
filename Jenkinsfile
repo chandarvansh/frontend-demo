@@ -1,3 +1,4 @@
+// Jenkinsfile - compatible version (no unsupported options)
 pipeline {
   agent {
     kubernetes {
@@ -39,11 +40,6 @@ spec:
     WORKDIR = "${env.WORKSPACE}"
   }
 
-  options {
-    timestamps()
-    ansiColor('xterm')
-  }
-
   stages {
     stage('Checkout') {
       steps {
@@ -53,7 +49,6 @@ spec:
 
     stage('Use Nexus npm proxy') {
       steps {
-        // ensure npm uses Nexus npm-proxy
         sh "echo 'registry=http://nexus:8081/repository/npm-proxy/' > .npmrc"
         sh "cat .npmrc"
       }
@@ -82,8 +77,6 @@ spec:
               cp "$KCFG" $WORKSPACE/.kube/config
               chmod 600 $WORKSPACE/.kube/config
               export KUBECONFIG=$WORKSPACE/.kube/config
-              echo "kubectl context:"
-              # don't fail if kubectl not present yet
               command -v kubectl >/dev/null 2>&1 && kubectl config current-context || true
             '''
           }
@@ -97,16 +90,16 @@ spec:
           sh '''
             set -euo pipefail
             if command -v kubectl >/dev/null 2>&1; then
-              echo "kubectl already present: $(kubectl version --client 2>/dev/null || true)"
+              echo "kubectl present: $(kubectl version --client 2>/dev/null || true)"
             else
-              echo "Installing kubectl to \$HOME/.local/bin..."
+              echo "Installing kubectl to $HOME/.local/bin ..."
               STABLE=$(curl -L -s https://dl.k8s.io/release/stable.txt)
               curl -L -o /tmp/kubectl "https://dl.k8s.io/release/${STABLE}/bin/linux/amd64/kubectl"
               chmod +x /tmp/kubectl
               mkdir -p $HOME/.local/bin
               mv /tmp/kubectl $HOME/.local/bin/kubectl
               export PATH=$HOME/.local/bin:$PATH
-              echo "kubectl installed: $(command -v kubectl)"; kubectl version --client || true
+              kubectl version --client || true
             fi
           '''
         }
@@ -119,17 +112,11 @@ spec:
           sh '''
             set -euo pipefail
             TMPCTX=$(mktemp -d)
-            echo "creating temp context: $TMPCTX"
-            # copy only what Kaniko needs (Dockerfile + dist output + package*.json)
             cp -v Dockerfile "$TMPCTX/" || true
-            if [ -d dist ]; then
-              cp -r dist "$TMPCTX/"
-            fi
+            if [ -d dist ]; then cp -r dist "$TMPCTX/"; fi
             cp -v package*.json "$TMPCTX/" || true
-            # verify
             ls -la "$TMPCTX"
             tar -C "$TMPCTX" -czf workspace.tar.gz .
-            echo "Context tar created: $(ls -lh workspace.tar.gz)"
             rm -rf "$TMPCTX"
           '''
         }
@@ -172,22 +159,15 @@ spec:
         secretName: nexus-docker-secret
 YAML
 
-              # create pod
               kubectl -n ${NAMESPACE} apply -f kaniko-pod.yaml
 
-              # wait for pod to appear
               for i in {1..30}; do
                 if kubectl -n ${NAMESPACE} get pod ${POD_NAME} >/dev/null 2>&1; then break; fi
                 sleep 1
               done
 
-              # copy tar
               kubectl -n ${NAMESPACE} cp workspace.tar.gz ${POD_NAME}:/workspace/workspace.tar.gz
-
-              # stream logs until finished
               kubectl -n ${NAMESPACE} logs -f ${POD_NAME}
-
-              # cleanup
               kubectl -n ${NAMESPACE} delete pod ${POD_NAME} --ignore-not-found
             '''
           }
@@ -201,7 +181,6 @@ YAML
           sh '''
             set -euo pipefail
             export KUBECONFIG=$WORKSPACE/.kube/config
-            # apply or update (use set image then fallback to apply)
             kubectl -n ${NAMESPACE} set image deployment/frontend-deployment frontend=${IMAGE}:${TAG} --record || kubectl -n ${NAMESPACE} apply -f k8s/frontend-deployment.yaml
           '''
         }
@@ -210,11 +189,7 @@ YAML
   }
 
   post {
-    success {
-      echo "Deployed ${IMAGE}:${TAG}"
-    }
-    failure {
-      echo "Pipeline failed - check console output"
-    }
+    success { echo "Deployed ${IMAGE}:${TAG}" }
+    failure { echo "Pipeline failed - check console output" }
   }
 }
