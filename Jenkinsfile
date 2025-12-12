@@ -1,4 +1,3 @@
-// Jenkinsfile - updated (Kubernetes pod + Kaniko + on-the-fly kubectl)
 pipeline {
   agent {
     kubernetes {
@@ -16,7 +15,7 @@ spec:
   - name: node
     image: node:18-bullseye
     command:
-    - cat
+      - cat
     tty: true
     resources:
       requests:
@@ -37,6 +36,12 @@ spec:
     IMAGE = "nexus:5000/chandarvansh/frontend"
     TAG   = "${env.BUILD_NUMBER}"
     NAMESPACE = "dev-cicd"
+    WORKDIR = "${env.WORKSPACE}"
+  }
+
+  options {
+    timestamps()
+    ansiColor('xterm')
   }
 
   stages {
@@ -48,7 +53,7 @@ spec:
 
     stage('Use Nexus npm proxy') {
       steps {
-        // ensure npm uses your nexus npm-proxy
+        // ensure npm uses Nexus npm-proxy
         sh "echo 'registry=http://nexus:8081/repository/npm-proxy/' > .npmrc"
         sh "cat .npmrc"
       }
@@ -58,10 +63,8 @@ spec:
       steps {
         container('node') {
           sh '''
-            set -e
-            node --version || true
-            npm --version || true
-            # install dependencies and build
+            set -euo pipefail
+            echo "node: $(node -v) npm: $(npm -v)"
             npm ci
             npm run build -- --configuration production
           '''
@@ -71,37 +74,63 @@ spec:
 
     stage('Prepare kubeconfig') {
       steps {
-        // inject kubeconfig file from Jenkins credentials (secret file)
         withCredentials([file(credentialsId: 'jenkins-kubeconfig', variable: 'KCFG')]) {
           container('node') {
             sh '''
-              mkdir -p $HOME/.kube
-              cp "$KCFG" $HOME/.kube/config
-              chmod 600 $HOME/.kube/config
-              echo "kubectl current-context:"
-              kubectl config current-context || true
+              set -euo pipefail
+              mkdir -p $WORKSPACE/.kube
+              cp "$KCFG" $WORKSPACE/.kube/config
+              chmod 600 $WORKSPACE/.kube/config
+              export KUBECONFIG=$WORKSPACE/.kube/config
+              echo "kubectl context:"
+              # don't fail if kubectl not present yet
+              command -v kubectl >/dev/null 2>&1 && kubectl config current-context || true
             '''
           }
         }
       }
     }
 
-    stage('Ensure kubectl installed') {
+    stage('Ensure kubectl installed (no sudo)') {
       steps {
-        // install kubectl inside the node container so we don't rely on a separate image
         container('node') {
           sh '''
-            set -e
+            set -euo pipefail
             if command -v kubectl >/dev/null 2>&1; then
-              echo "kubectl already present: $(kubectl version --client --short || true)"
+              echo "kubectl already present: $(kubectl version --client 2>/dev/null || true)"
             else
-              echo "Installing kubectl..."
+              echo "Installing kubectl to \$HOME/.local/bin..."
               STABLE=$(curl -L -s https://dl.k8s.io/release/stable.txt)
               curl -L -o /tmp/kubectl "https://dl.k8s.io/release/${STABLE}/bin/linux/amd64/kubectl"
               chmod +x /tmp/kubectl
-              sudo mv /tmp/kubectl /usr/local/bin/kubectl || (mkdir -p /usr/local/bin && mv /tmp/kubectl /usr/local/bin/kubectl)
-              kubectl version --client --short || true
+              mkdir -p $HOME/.local/bin
+              mv /tmp/kubectl $HOME/.local/bin/kubectl
+              export PATH=$HOME/.local/bin:$PATH
+              echo "kubectl installed: $(command -v kubectl)"; kubectl version --client || true
             fi
+          '''
+        }
+      }
+    }
+
+    stage('Build & Package for Kaniko') {
+      steps {
+        container('node') {
+          sh '''
+            set -euo pipefail
+            TMPCTX=$(mktemp -d)
+            echo "creating temp context: $TMPCTX"
+            # copy only what Kaniko needs (Dockerfile + dist output + package*.json)
+            cp -v Dockerfile "$TMPCTX/" || true
+            if [ -d dist ]; then
+              cp -r dist "$TMPCTX/"
+            fi
+            cp -v package*.json "$TMPCTX/" || true
+            # verify
+            ls -la "$TMPCTX"
+            tar -C "$TMPCTX" -czf workspace.tar.gz .
+            echo "Context tar created: $(ls -lh workspace.tar.gz)"
+            rm -rf "$TMPCTX"
           '''
         }
       }
@@ -109,19 +138,16 @@ spec:
 
     stage('Build & Push image (Kaniko)') {
       steps {
-        // Use Kaniko in cluster to push to registry. It will use existing secret nexus-docker-secret in dev-cicd namespace
         withCredentials([usernamePassword(credentialsId: 'nexus-docker-creds', usernameVariable: 'NEXUS_USER', passwordVariable: 'NEXUS_PASS')]) {
           container('node') {
             sh '''
-              set -e
-              # tar workspace for Kaniko
-              tar -czf workspace.tar.gz .
-
+              set -euo pipefail
+              POD_NAME="kaniko-build-${BUILD_NUMBER}"
               cat > kaniko-pod.yaml <<'YAML'
 apiVersion: v1
 kind: Pod
 metadata:
-  generateName: kaniko-build-
+  name: ${POD_NAME}
   namespace: ${NAMESPACE}
 spec:
   restartPolicy: Never
@@ -146,30 +172,23 @@ spec:
         secretName: nexus-docker-secret
 YAML
 
-              # apply pod - Kaniko will pick up workspace when we copy the tar into the pod
+              # create pod
               kubectl -n ${NAMESPACE} apply -f kaniko-pod.yaml
 
-              # wait for pod name
-              for i in {1..20}; do
-                POD=$(kubectl -n ${NAMESPACE} get pods -l job-name!=,generateName=, --no-headers -o custom-columns=":metadata.name" | grep '^kaniko-build-' || true)
-                if [ -n "$POD" ]; then break; fi
+              # wait for pod to appear
+              for i in {1..30}; do
+                if kubectl -n ${NAMESPACE} get pod ${POD_NAME} >/dev/null 2>&1; then break; fi
                 sleep 1
               done
 
-              POD=$(kubectl -n ${NAMESPACE} get pods --no-headers -o custom-columns=":metadata.name" | grep '^kaniko-build-' || true)
-              if [ -z "$POD" ]; then
-                echo "kaniko pod not found; listing pods:"
-                kubectl -n ${NAMESPACE} get pods -o wide
-                exit 1
-              fi
+              # copy tar
+              kubectl -n ${NAMESPACE} cp workspace.tar.gz ${POD_NAME}:/workspace/workspace.tar.gz
 
-              echo "Kaniko pod: $POD"
-              # copy context and stream logs
-              kubectl -n ${NAMESPACE} cp workspace.tar.gz ${POD}:/workspace/workspace.tar.gz || true
-              kubectl -n ${NAMESPACE} logs -f ${POD}
+              # stream logs until finished
+              kubectl -n ${NAMESPACE} logs -f ${POD_NAME}
 
               # cleanup
-              kubectl -n ${NAMESPACE} delete pod ${POD} || true
+              kubectl -n ${NAMESPACE} delete pod ${POD_NAME} --ignore-not-found
             '''
           }
         }
@@ -180,10 +199,10 @@ YAML
       steps {
         container('node') {
           sh '''
-            set -e
-            # Replace image in deployment (apply fallback)
-            kubectl -n ${NAMESPACE} set image deployment/frontend-deployment frontend=${IMAGE}:${TAG} --record || \
-              kubectl -n ${NAMESPACE} apply -f k8s/frontend-deployment.yaml
+            set -euo pipefail
+            export KUBECONFIG=$WORKSPACE/.kube/config
+            # apply or update (use set image then fallback to apply)
+            kubectl -n ${NAMESPACE} set image deployment/frontend-deployment frontend=${IMAGE}:${TAG} --record || kubectl -n ${NAMESPACE} apply -f k8s/frontend-deployment.yaml
           '''
         }
       }
@@ -195,7 +214,7 @@ YAML
       echo "Deployed ${IMAGE}:${TAG}"
     }
     failure {
-      echo "Pipeline failed - see console output"
+      echo "Pipeline failed - check console output"
     }
   }
 }
